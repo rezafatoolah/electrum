@@ -1174,6 +1174,9 @@ This will result in longer routes; it might increase your fees and decrease the 
     ZEROCONF_TRUSTED_NODE = ConfigVar('zeroconf_trusted_node', default='', type_=str)
     ZEROCONF_MIN_OPENING_FEE = ConfigVar('zeroconf_min_opening_fee', default=5000, type_=int)
 
+    # serve channel backups
+    LIGHTNING_PEERBACKUP_SERVER = ConfigVar('lightning_peerbackup_server', default=False, type_=bool)
+
     # connect to remote WT
     WATCHTOWER_CLIENT_ENABLED = ConfigVar(
         'use_watchtower', default=False, type_=bool,

@@ -8,6 +8,8 @@ from .util import bfh, with_lock
 if TYPE_CHECKING:
     from .json_db import StoredDict
 
+from .logging import get_logger
+_logger = get_logger(__name__)
 
 class HTLCManager:
 
@@ -100,6 +102,19 @@ class HTLCManager:
         self._maybe_active_htlc_ids[REMOTE].add(htlc_id)
 
     @with_lock
+    def cleanup(self) -> None:
+        for proposer in [LOCAL, REMOTE]:
+            for htlc_id in list(self.log[proposer]['adds'].keys()):
+                if self.is_htlc_irrevocably_removed_yet(htlc_proposer=proposer, htlc_id=htlc_id):
+                    if htlc_id != self.log[proposer]['next_htlc_id'] - 1:
+                        print(f'removing {proposer} {htlc_id}')
+                        self.log[proposer]['adds'].pop(htlc_id)
+                        self.log[proposer]['locked_in'].pop(htlc_id)
+                        self.log[proposer]['settles'].pop(htlc_id, None)
+                        self.log[proposer]['fails'].pop(htlc_id, None)
+                        self._maybe_active_htlc_ids[proposer].discard(htlc_id)
+
+    @with_lock
     def send_settle(self, htlc_id: int) -> None:
         next_ctn = self.ctn_latest(REMOTE) + 1
         if not self.is_htlc_active_at_ctn(ctx_owner=REMOTE, ctn=next_ctn, htlc_proposer=REMOTE, htlc_id=htlc_id):
@@ -165,21 +180,34 @@ class HTLCManager:
 
     @with_lock
     def send_rev(self) -> None:
+        self.send_rev_local()
+        self.send_rev_remote()
+
+    @with_lock
+    def send_rev_local(self) -> None:
         self.log[LOCAL]['ctn'] += 1
         self._set_revack_pending(LOCAL, False)
         self.log[LOCAL]['was_revoke_last'] = True
         # htlcs
-        for htlc_id in self._maybe_active_htlc_ids[REMOTE]:
-            ctns = self.log[REMOTE]['locked_in'][htlc_id]
-            if ctns[REMOTE] is None and ctns[LOCAL] <= self.ctn_latest(LOCAL):
-                ctns[REMOTE] = self.ctn_latest(REMOTE) + 1
         for log_action in ('settles', 'fails'):
             for htlc_id in self._maybe_active_htlc_ids[LOCAL]:
                 ctns = self.log[LOCAL][log_action].get(htlc_id, None)
                 if ctns is None: continue
                 if ctns[REMOTE] is None and ctns[LOCAL] <= self.ctn_latest(LOCAL):
                     ctns[REMOTE] = self.ctn_latest(REMOTE) + 1
-        self._update_maybe_active_htlc_ids()
+        self._update_maybe_active_htlc_ids(LOCAL)
+
+    @with_lock
+    def send_rev_remote(self) -> None:
+        # here we lock in htlcs proposed by remote
+        # should have done that when receiving commitment?
+        # maybe alice should do it when sending ctx?
+        for htlc_id in self._maybe_active_htlc_ids[REMOTE]:
+            ctns = self.log[REMOTE]['locked_in'][htlc_id]
+            if ctns[REMOTE] is None and ctns[LOCAL] <= self.ctn_latest(LOCAL):
+                ctns[REMOTE] = self.ctn_latest(REMOTE) + 1
+                _logger.info(f'locking in remote: {htlc_id} {ctns[REMOTE]}')
+        self._update_maybe_active_htlc_ids(REMOTE)
         # fee updates
         for k, fee_update in list(self.log[REMOTE]['fee_updates'].items()):
             if fee_update.ctn_remote is None and fee_update.ctn_local <= self.ctn_latest(LOCAL):
@@ -187,30 +215,39 @@ class HTLCManager:
 
     @with_lock
     def recv_rev(self) -> None:
-        self.log[REMOTE]['ctn'] += 1
-        self._set_revack_pending(REMOTE, False)
+        self.recv_rev_local()
+        self.recv_rev_remote()
+        # no need to keep local update raw msgs anymore, they have just been ACKed.
+        self.log[LOCAL]['unacked_updates'].pop(self.log[REMOTE]['ctn'], None)
+
+    @with_lock
+    def recv_rev_local(self) -> None:
         # htlcs
         for htlc_id in self._maybe_active_htlc_ids[LOCAL]:
             ctns = self.log[LOCAL]['locked_in'][htlc_id]
             if ctns[LOCAL] is None and ctns[REMOTE] <= self.ctn_latest(REMOTE):
                 ctns[LOCAL] = self.ctn_latest(LOCAL) + 1
+        self._update_maybe_active_htlc_ids(LOCAL)
+        # fee updates
+        for k, fee_update in list(self.log[LOCAL]['fee_updates'].items()):
+            if fee_update.ctn_local is None and fee_update.ctn_remote <= self.ctn_latest(REMOTE):
+                fee_update.ctn_local = self.ctn_latest(LOCAL) + 1
+
+    @with_lock
+    def recv_rev_remote(self) -> None:
+        self.log[REMOTE]['ctn'] += 1
+        self._set_revack_pending(REMOTE, False)
+        # htlcs
         for log_action in ('settles', 'fails'):
             for htlc_id in self._maybe_active_htlc_ids[REMOTE]:
                 ctns = self.log[REMOTE][log_action].get(htlc_id, None)
                 if ctns is None: continue
                 if ctns[LOCAL] is None and ctns[REMOTE] <= self.ctn_latest(REMOTE):
                     ctns[LOCAL] = self.ctn_latest(LOCAL) + 1
-        self._update_maybe_active_htlc_ids()
-        # fee updates
-        for k, fee_update in list(self.log[LOCAL]['fee_updates'].items()):
-            if fee_update.ctn_local is None and fee_update.ctn_remote <= self.ctn_latest(REMOTE):
-                fee_update.ctn_local = self.ctn_latest(LOCAL) + 1
-
-        # no need to keep local update raw msgs anymore, they have just been ACKed.
-        self.log[LOCAL]['unacked_updates'].pop(self.log[REMOTE]['ctn'], None)
+        self._update_maybe_active_htlc_ids(REMOTE)
 
     @with_lock
-    def _update_maybe_active_htlc_ids(self) -> None:
+    def _update_maybe_active_htlc_ids(self, htlc_proposer) -> None:
         # - Loosely, we want a set that contains the htlcs that are
         #   not "removed and revoked from all ctxs of both parties". (self._maybe_active_htlc_ids)
         #   It is guaranteed that those htlcs are in the set, but older htlcs might be there too:
@@ -218,7 +255,8 @@ class HTLCManager:
         # - balance_delta is in sync with maybe_active_htlc_ids. When htlcs are removed from the latter,
         #   balance_delta is updated to reflect that htlc.
         sanity_margin = 1
-        for htlc_proposer in (LOCAL, REMOTE):
+        #for htlc_proposer in (LOCAL, REMOTE):
+        if 1:
             for log_action in ('settles', 'fails'):
                 for htlc_id in list(self._maybe_active_htlc_ids[htlc_proposer]):
                     ctns = self.log[htlc_proposer][log_action].get(htlc_id, None)
@@ -242,7 +280,8 @@ class HTLCManager:
             for htlc_id in self.log[htlc_proposer]['adds']:
                 self._maybe_active_htlc_ids[htlc_proposer].add(htlc_id)
         # remove old htlcs
-        self._update_maybe_active_htlc_ids()
+        self._update_maybe_active_htlc_ids(LOCAL)
+        self._update_maybe_active_htlc_ids(REMOTE)
 
     @with_lock
     def discard_unsigned_remote_updates(self):

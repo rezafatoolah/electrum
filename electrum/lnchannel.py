@@ -520,6 +520,8 @@ class ChannelBackup(AbstractChannel):
             upfront_shutdown_script='',
             announcement_node_sig=b'',
             announcement_bitcoin_sig=b'',
+            next_per_commitment_point=None,
+            current_per_commitment_point=None,
         )
         self.config[REMOTE] = RemoteConfig(
             # payment_basepoint needed to deobfuscate ctn in our_ctx
@@ -537,11 +539,14 @@ class ChannelBackup(AbstractChannel):
             initial_msat = None,
             reserve_sat = None,
             htlc_minimum_msat=None,
+            current_commitment_signature=None,
+            current_htlc_signatures=b'',
             next_per_commitment_point=None,
             current_per_commitment_point=None,
             upfront_shutdown_script='',
             announcement_node_sig=b'',
             announcement_bitcoin_sig=b'',
+            encrypted_seed=None,
         )
 
     def can_be_deleted(self):
@@ -1100,6 +1105,9 @@ class Channel(AbstractChannel):
         htlcsigs = [x[1] for x in htlcsigs]
         with self.db_lock:
             self.hm.send_ctx()
+            self.config[REMOTE].current_commitment_signature=sig_64
+            self.config[REMOTE].current_htlc_signatures=b''.join(htlcsigs)
+
         return sig_64, htlcsigs
 
     def receive_new_commitment(self, sig: bytes, htlc_sigs: Sequence[bytes]) -> None:
@@ -1185,15 +1193,21 @@ class Channel(AbstractChannel):
 
     def revoke_current_commitment(self):
         self.logger.info("revoke_current_commitment")
+        self.hm.recv_rev_local() # so that the sig of alice is good when she sends the next rev
+
         new_ctn = self.get_latest_ctn(LOCAL)
         new_ctx = self.get_latest_commitment(LOCAL)
+        last_secret, last_point = self.get_secret_and_point(LOCAL, new_ctn - 1)
+        next_secret, next_point = self.get_secret_and_point(LOCAL, new_ctn + 1)
+
         if not self.signature_fits(new_ctx):
             # this should never fail; as receive_new_commitment already did this test
             raise Exception("refusing to revoke as remote sig does not fit")
         with self.db_lock:
+            self.config[LOCAL].current_per_commitment_point=self.config[LOCAL].next_per_commitment_point
+            self.config[LOCAL].next_per_commitment_point=next_point
             self.hm.send_rev()
-        last_secret, last_point = self.get_secret_and_point(LOCAL, new_ctn - 1)
-        next_secret, next_point = self.get_secret_and_point(LOCAL, new_ctn + 1)
+
         return RevokeAndAck(last_secret, next_point)
 
     def receive_revocation(self, revocation: RevokeAndAck):
@@ -1699,3 +1713,217 @@ class Channel(AbstractChannel):
             self.logger.info('funding outpoint mismatch')
             return False
         return True
+
+    def get_their_revocation_store(self):
+        seed = self.config[LOCAL].per_commitment_secret_seed
+        ctn = self.get_oldest_unrevoked_ctn(LOCAL)
+        store = RevocationStore.from_seed_and_index(seed, ctn)
+        s = store.storage
+        for k, v in list(s['buckets'].items()):
+            hh, cc = v
+            s['buckets'][k] = hh.hex(), cc
+        return s
+
+    def receive_new_peerbackup(self, signature:bytes, owner: HTLCOwner):
+        peerbackup_bytes = self.get_their_peerbackup_bytes(owner)
+        sighash = sha256d(peerbackup_bytes)
+        pubkey = self.config[REMOTE].multisig_key.pubkey
+        if not ecc.verify_signature(pubkey, signature, sighash):
+            self.logger.info(f'receive_new_peerbackup {owner}: incorrect signature')
+            with open("bob_their_peerbackup", "w") as f:
+                our_state = json.loads(peerbackup_bytes.decode('utf8'))
+                f.write(json.dumps(our_state, sort_keys=True, indent=2))
+            raise Exception(f'incorrect signature')
+        else:
+            self.logger.info(f'receive_new_peerbackup {owner}: good signature')
+
+        if owner == REMOTE:
+            self.storage['their_signed_remote_state'] = peerbackup_bytes.hex()
+            self.storage['their_signature_remote_state'] = signature.hex()
+        else:
+            self.storage['their_signed_local_state'] = peerbackup_bytes.hex()
+            self.storage['their_signature_local_state'] = signature.hex()
+
+    def get_our_peerbackup(self) -> dict:
+        # convert storeddict to dict
+        state = json.loads(json.dumps(self.storage, cls=util.MyEncoder))
+        # remove private keys
+        for key in ['delayed_basepoint', 'revocation_basepoint', 'multisig_key', 'htlc_basepoint']:
+            state['local_config'][key].pop('privkey')
+        state['local_config'].pop('per_commitment_secret_seed')
+        # encrypt seed (todo)
+        # remove peerbackup signature
+        state.pop('their_signed_local_state', None)
+        state.pop('their_signed_remote_state', None)
+        state.pop('their_signature_local_state', None)
+        state.pop('their_signature_remote_state', None)
+        state.pop('our_local_state_hash', None)
+        state.pop('our_remote_state_hash', None)
+        state.pop('unfulfilled_htlcs') # todo: make sure we can fail unfulfilled htlcs after restore
+        # remove alias.
+        state.pop('local_scid_alias')
+        state.pop('funding_inputs', None) # only initiator has this
+        state.pop('has_onchain_backup', None)
+        state.pop('onion_keys')
+        state.pop('peer_network_addresses', None)
+        state['local_config'].pop('was_announced', None)
+        state['local_config'].pop('funding_locked_received')
+        state['log']['1'].pop('was_revoke_last')
+        state['log']['1'].pop('unacked_updates')
+        # revack pending cannot be reconstructed, it depends on message ordering
+        state['log']['1']['revack_pending'] = False
+        state['log']['-1']['revack_pending'] = False
+        channel_seed = state['local_config'].pop('channel_seed')
+        state['local_config']['encrypted_seed'] = channel_seed
+        state.pop('alias')
+        state.pop('init_timestamp', None)
+        return state
+
+    def get_their_peerbackup(self) -> dict:
+        def flip_values(d:dict, key_a, key_b):
+            a = d.pop(key_a)
+            b = d.pop(key_b)
+            d[key_a] = b
+            d[key_b] = a
+        # flip values of log and config
+        state = self.get_our_peerbackup()
+        log = state['log']
+        flip_values(state, 'local_config', 'remote_config')
+        flip_values(log, '-1', '1')
+        for owner in ['-1', '1']:
+            for subkey in ['locked_in', 'settles', 'fails']:
+                d = log[owner][subkey]
+                for htlc_id in list(d.keys()):
+                    flip_values(d[htlc_id], '-1', '1')
+            d = log[owner]['fee_updates']
+            for k in list(d.keys()):
+                flip_values(d[k], 'ctn_local', 'ctn_remote')
+        state['constraints']['is_initiator'] = not state['constraints']['is_initiator']
+        state['node_id'] = self.lnworker.node_keypair.pubkey.hex()
+        return state
+
+    def get_our_signed_peerbackup(self, owner) -> dict:
+        state = self.get_our_peerbackup()
+        state['log'].pop('1' if owner == REMOTE else '-1')
+        state.pop('local_config' if owner == REMOTE  else 'remote_config')
+        if owner == LOCAL:
+            state.pop('revocation_store')
+        return state
+
+    def get_their_signed_peerbackup(self, owner) -> dict:
+        state = self.get_their_peerbackup()
+        state['log'].pop('1' if owner == REMOTE else '-1')
+        state.pop('local_config' if owner == REMOTE  else 'remote_config')
+        if owner == REMOTE:
+            state['remote_config']['encrypted_seed'] = None
+            state['revocation_store'] = self.get_their_revocation_store()
+        else:
+            state.pop('revocation_store')
+        return state
+
+    def get_our_peerbackup_bytes(self, owner) -> bytes:
+        return bytes(json.dumps(self.get_our_signed_peerbackup(owner), sort_keys=True), "utf8")
+
+    def get_their_peerbackup_bytes(self, owner) -> bytes:
+        return bytes(json.dumps(self.get_their_signed_peerbackup(owner), sort_keys=True), "utf8")
+
+    def get_our_peerbackup_signature(self, owner):
+        peerbackup_bytes = self.get_our_peerbackup_bytes(owner)
+        sighash = sha256d(peerbackup_bytes)
+        privkey = self.config[LOCAL].multisig_key.privkey
+        signature = ecc.ECPrivkey(privkey).sign(sighash, ecc.sig_string_from_r_and_s)
+        pubkey = self.config[LOCAL].multisig_key.pubkey
+        assert ecc.verify_signature(pubkey, signature, sighash)
+        with open("our_signed_state", "w") as f:
+            our_state = json.loads(peerbackup_bytes.decode('utf8'))
+            f.write(json.dumps(our_state, sort_keys=True, indent=2))
+        s = 'our_local_state_hash' if owner == LOCAL else 'our_remote_state_hash'
+        self.storage[s] = sighash.hex()
+        return signature
+
+    def verify_peerbackup_signatures(self, peerbackup_bytes, local_signature, remote_signature):
+        pubkey = self.config[LOCAL].multisig_key.pubkey
+        local_peerbackup = json.loads(peerbackup_bytes)
+        local_peerbackup.pop('revocation_store')
+        local_peerbackup.pop('remote_config')
+        local_peerbackup['log'].pop('-1')
+        local_peerbackup_bytes = bytes(json.dumps(local_peerbackup, sort_keys=True), "utf8")
+        local_sighash = sha256d(local_peerbackup_bytes)
+        if not ecc.verify_signature(pubkey, local_signature, local_sighash):
+            raise Exception(f'incorrect peerbackup signature')
+        remote_peerbackup = json.loads(peerbackup_bytes)
+        remote_peerbackup.pop('local_config')
+        remote_peerbackup['log'].pop('1')
+        remote_peerbackup_bytes = bytes(json.dumps(remote_peerbackup, sort_keys=True), "utf8")
+        remote_sighash = sha256d(remote_peerbackup_bytes)
+        if not ecc.verify_signature(pubkey, remote_signature, remote_sighash):
+            raise Exception(f'incorrect peerbackup signature')
+        return local_sighash, remote_sighash
+
+    def get_their_peerbackup_signature(self, owner):
+        s = 'their_signature_local_state' if owner == LOCAL else 'their_signature_remote_state'
+        their_signature = self.storage.get(s) or 64*'00'
+        return bytes.fromhex(their_signature)
+
+    def get_their_reconstructed_peerbackup_bytes(self):
+        local_peerbackup = json.loads(bytes.fromhex(self.storage.get('their_signed_local_state')))
+        remote_peerbackup = json.loads(bytes.fromhex(self.storage.get('their_signed_remote_state')))
+        #
+        local_peerbackup['revocation_store'] = remote_peerbackup['revocation_store']
+        local_peerbackup['remote_config'] = remote_peerbackup['remote_config']
+        local_peerbackup['log']['-1'] = remote_peerbackup['log']['-1']
+        #
+        remote_peerbackup['local_config'] = local_peerbackup['local_config']
+        remote_peerbackup['log']['1'] = local_peerbackup['log']['1']
+        #
+        assert local_peerbackup == remote_peerbackup
+        return bytes(json.dumps(local_peerbackup, sort_keys=True), "utf8")
+
+    def get_signed_timestamp(self):
+        timestamp = int(100*time.time())
+        local_ctn = self.get_latest_ctn(LOCAL)
+        remote_ctn = self.get_latest_ctn(REMOTE)
+        timetuple = 24*b't'
+        sighash = sha256d(timetuple)
+        privkey = self.config[LOCAL].multisig_key.privkey
+        signature = ecc.ECPrivkey(privkey).sign(sighash, ecc.sig_string_from_r_and_s)
+        return local_ctn, remote_ctn, timestamp, signature
+
+    def compare_peerbackup_with_last_hash(self, peerbackup_bytes, local_sighash, remote_sighash):
+        our_local_sighash = bytes.fromhex(self.storage.get('our_local_state_hash', ''))
+        our_remote_sighash = bytes.fromhex(self.storage.get('our_remote_state_hash', ''))
+        if local_sighash == our_local_sighash and remote_sighash == our_remote_sighash:
+            return True
+        their_claim_of_our_state = json.loads(peerbackup_bytes.decode('utf8'))
+        with open("their_claim_of_our_state", "w") as f:
+            f.write(json.dumps(their_claim_of_our_state, sort_keys=True, indent=2))
+        return False
+
+    def restore_state_from_peer_backup(self, data_bytes: bytes):
+        from .lnutil import BIP32Node, generate_keypair, LnKeyFamily
+        state = json.loads(data_bytes.decode('utf8'))
+        channels = self.lnworker.db.get_dict("channels")
+        channel_id = self.channel_id.hex()
+        assert channel_id in channels
+        local_config = state['local_config']
+        encrypted_seed = local_config.pop('encrypted_seed')
+        channel_seed = bytes.fromhex(encrypted_seed)
+        local_config['channel_seed'] = channel_seed.hex()
+        local_config['funding_locked_received'] = True
+        local_config['was_announced'] = False
+        node = BIP32Node.from_rootseed(channel_seed, xtype='standard')
+        keypair_generator = lambda family: generate_keypair(node, family)
+        local_config['per_commitment_secret_seed'] = keypair_generator(LnKeyFamily.REVOCATION_ROOT).privkey.hex()
+        local_config['multisig_key']['privkey'] = keypair_generator(LnKeyFamily.MULTISIG).privkey.hex()
+        local_config['htlc_basepoint']['privkey'] = keypair_generator(LnKeyFamily.HTLC_BASE).privkey.hex()
+        local_config['delayed_basepoint']['privkey'] = keypair_generator(LnKeyFamily.DELAY_BASE).privkey.hex()
+        local_config['revocation_basepoint']['privkey'] = keypair_generator(LnKeyFamily.REVOCATION_BASE).privkey.hex()
+
+        state['onion_keys'] = {}
+        state['unfulfilled_htlcs'] = {}
+        state['log']['1']['was_revoke_last'] = False
+        state['log']['1']['unacked_updates'] = {}
+        # this does type conversion
+        channels[channel_id] = state
+        storage = channels[channel_id]
+        self.__init__(storage, lnworker=self.lnworker)
